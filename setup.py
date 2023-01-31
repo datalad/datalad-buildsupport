@@ -8,17 +8,48 @@
 
 import datetime
 import os
-
 from os.path import (
     dirname,
     join as opj,
+    sep as pathsep,
+    splitext,
 )
-from setuptools import Command, DistutilsOptionError
-from setuptools.config import read_configuration
-
+import setuptools
 import versioneer
+from packaging.version import Version
+from setuptools import (
+    Command,
+    DistutilsOptionError,
+    find_namespace_packages,
+    findall,
+    setup,
+)
 
 from . import formatters as fmt
+
+
+def _path_rel2file(*p):
+    # dirname instead of joining with pardir so it works if
+    # datalad_build_support/ is just symlinked into some extension
+    # while developing
+    return opj(dirname(dirname(__file__)), *p)
+
+
+def get_version(name):
+    """Determine version via importlib_metadata
+
+    Parameters
+    ----------
+    name: str
+      Name of the folder (package) where from to read version.py
+    """
+    # delay import so we do not require it for a simple setup stage
+    try:
+        from importlib.metadata import version as importlib_version
+    except ImportError:
+        # TODO - remove whenever python >= 3.8
+        from importlib_metadata import version as importlib_version
+    return importlib_version(name)
 
 
 class BuildManPage(Command):
@@ -46,7 +77,7 @@ class BuildManPage(Command):
     def initialize_options(self):
         self.manpath = opj('build', 'man')
         self.rstpath = opj('docs', 'source', 'generated', 'man')
-        self.parser = 'datalad.cmdline.main:setup_parser'
+        self.parser = 'datalad.cli.parser:setup_parser'
         self.cmdsuite = None
 
     def finalize_options(self):
@@ -210,8 +241,8 @@ class BuildConfigInfo(Command):
         if not os.path.exists(opath):
             os.makedirs(opath)
 
-        from datalad.interface.common_cfg import definitions as cfgdefs
         from datalad.dochelpers import _indent
+        from datalad.interface.common_cfg import definitions as cfgdefs
 
         categories = {
             'global': {},
@@ -252,3 +283,100 @@ class BuildConfigInfo(Command):
                         desc_tmpl += 'undocumented\n'
                     v.update(docs)
                     rst.write(_indent(desc_tmpl.format(**v), '    '))
+
+
+def get_long_description_from_README():
+    """Read README.md, convert to .rst using pypandoc
+
+    If pypandoc is not available or fails - just output original .md.
+
+    Returns
+    -------
+    dict
+      with keys long_description and possibly long_description_content_type
+      for newer setuptools which support uploading of markdown as is.
+    """
+    # PyPI used to not render markdown. Workaround for a sane appearance
+    # https://github.com/pypa/pypi-legacy/issues/148#issuecomment-227757822
+    # is still in place for older setuptools
+
+    README = opj(_path_rel2file('README.md'))
+
+    ret = {}
+    if Version(setuptools.__version__) >= Version('38.6.0'):
+        # check than this
+        ret['long_description'] = open(README).read()
+        ret['long_description_content_type'] = 'text/markdown'
+        return ret
+
+    # Convert or fall-back
+    try:
+        import pypandoc
+        return {'long_description': pypandoc.convert(README, 'rst')}
+    except (ImportError, OSError) as exc:
+        # attempting to install pandoc via brew on OSX currently hangs and
+        # pypandoc imports but throws OSError demanding pandoc
+        print(
+                "WARNING: pypandoc failed to import or thrown an error while "
+                "converting"
+                " README.md to RST: %r   .md version will be used as is" % exc
+        )
+        return {'long_description': open(README).read()}
+
+
+def findsome(subdir, extensions):
+    """Find files under subdir having specified extensions
+
+    Leading directory (datalad) gets stripped
+    """
+    return [
+        f.split(pathsep, 1)[1] for f in findall(opj('datalad', subdir))
+        if splitext(f)[-1].lstrip('.') in extensions
+    ]
+
+
+def datalad_setup(name, **kwargs):
+    """A helper for a typical invocation of setuptools.setup.
+
+    If not provided in kwargs, following fields will be autoset to the defaults
+    or obtained from the present on the file system files:
+
+    - author
+    - author_email
+    - packages -- all found packages which start with `name`
+    - long_description -- converted to .rst using pypandoc README.md
+    - version -- parsed `__version__` within `name/version.py`
+
+    Parameters
+    ----------
+    name: str
+        Name of the Python package
+    **kwargs:
+        The rest of the keyword arguments passed to setuptools.setup as is
+    """
+    # Simple defaults
+    for k, v in {
+        'author': "The DataLad Team and Contributors",
+        'author_email': "team@datalad.org"
+    }.items():
+        if kwargs.get(k) is None:
+            kwargs[k] = v
+
+    # More complex, requiring some function call
+
+    # Only recentish versions of find_packages support include
+    # packages = find_packages('.', include=['datalad*'])
+    # so we will filter manually for maximal compatibility
+    if kwargs.get('packages') is None:
+        # Use find_namespace_packages() in order to include folders that
+        # contain data files but no Python code
+        kwargs['packages'] = [pkg for pkg in find_namespace_packages('.') if pkg.startswith(name)]
+    if kwargs.get('long_description') is None:
+        kwargs.update(get_long_description_from_README())
+
+    cmdclass = kwargs.get('cmdclass', {})
+    # Check if command needs some module specific handling
+    for v in cmdclass.values():
+        if hasattr(v, 'handle_module'):
+            getattr(v, 'handle_module')(name, **kwargs)
+    return setup(name=name, **kwargs)
